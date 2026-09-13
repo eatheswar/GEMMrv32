@@ -25,7 +25,7 @@
 // global error variable
 #include <errno.h>
 #undef errno
-extern int errno;
+// extern int errno;
 
 // attributes to force syscall symbols (newlib link-time-optimization issue)
 #define SYSCALL_ATTR __attribute__((used, externally_visible, noinline))
