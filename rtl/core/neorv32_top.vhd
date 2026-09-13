@@ -355,8 +355,8 @@ architecture neorv32_top_rtl of neorv32_top is
   signal core_rsp : core_complex_rsp_t;
 
   -- bus: system --
-  signal sys1_req, sys2_req, dma_req, amo_req, sys3_req, imem_req, dmem_req, smc_req, io_req, xbus_req : bus_req_t;
-  signal sys1_rsp, sys2_rsp, dma_rsp, amo_rsp, sys3_rsp, imem_rsp, dmem_rsp, smc_rsp, io_rsp, xbus_rsp : bus_rsp_t;
+  signal sys1_req, sys2_req, sys2b_req, dma_req, cfs_req, amo_req, sys3_req, imem_req, dmem_req, smc_req, io_req, xbus_req : bus_req_t;
+  signal sys1_rsp, sys2_rsp, sys2b_rsp, dma_rsp, cfs_rsp, amo_rsp, sys3_rsp, imem_rsp, dmem_rsp, smc_rsp, io_rsp, xbus_rsp : bus_rsp_t;
   signal xbus_terminate : std_ulogic;
 
   -- bus: IO devices --
@@ -703,6 +703,34 @@ begin
     dma_req              <= req_terminate_c;
     dma_rsp              <= rsp_terminate_c;
   end generate;
+  -- CFS Bus Switch -------------------------------------------------------------------------
+  -- -------------------------------------------------------------------------------------------
+  cfs_bus_switch_enabled:
+  if IO_CFS_EN generate
+    cfs_bus_switch_inst: entity neorv32.neorv32_bus_switch
+    generic map (
+      ROUND_ROBIN_EN => false,
+      A_READ_ONLY    => false,
+      B_READ_ONLY    => false
+    )
+    port map (
+      clk_i   => clk_i,
+      rstn_i  => rstn_sys,
+      a_req_i => sys2_req,
+      a_rsp_o => sys2_rsp,
+      b_req_i => cfs_req,
+      b_rsp_o => cfs_rsp,
+      x_req_o => sys2b_req,
+      x_rsp_i => sys2b_rsp
+    );
+  end generate;
+
+  cfs_bus_switch_disabled:
+  if not IO_CFS_EN generate
+    sys2b_req <= sys2_req;
+    sys2_rsp  <= sys2b_rsp;
+    cfs_rsp   <= rsp_terminate_c;
+  end generate;
 
   -- **************************************************************************************************************************
   -- Atomic Memory Operations
@@ -719,8 +747,8 @@ begin
       port map (
         clk_i      => clk_i,
         rstn_i     => rstn_sys,
-        core_req_i => sys2_req,
-        core_rsp_o => sys2_rsp,
+        core_req_i => sys2b_req,
+        core_rsp_o => sys2b_rsp,
         sys_req_o  => amo_req,
         sys_rsp_i  => amo_rsp
       );
@@ -728,8 +756,8 @@ begin
 
     bus_amo_rmw_disabled:
     if not RISCV_ISA_Zaamo generate
-      amo_req  <= sys2_req;
-      sys2_rsp <= amo_rsp;
+      amo_req   <= sys2b_req;
+      sys2b_rsp <= amo_rsp;
     end generate;
 
     -- Reservation-Set Controller -------------------------------------------------------------
@@ -1074,7 +1102,9 @@ begin
         rsp_ack_o  => iodev_rsp(IODEV_CFS).ack,
         irq_o      => firq(FIRQ_CFS),
         cfs_in_i   => cfs_in_i,
-        cfs_out_o  => cfs_out_o
+        cfs_out_o  => cfs_out_o,
+        cfs_req_o  => cfs_req,
+        cfs_rsp_i  => cfs_rsp
       );
       iodev_rsp(IODEV_CFS).err <= '0';
     end generate;
@@ -1084,6 +1114,7 @@ begin
       iodev_rsp(IODEV_CFS) <= rsp_terminate_c;
       firq(FIRQ_CFS)       <= '0';
       cfs_out_o            <= (others => '0');
+      cfs_req              <= req_terminate_c;
     end generate;
 
     -- Serial Data Interface (SDI) ------------------------------------------------------------

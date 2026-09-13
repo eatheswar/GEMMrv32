@@ -1214,7 +1214,10 @@ package neorv32_package is
     rsp_ack_o  : out std_ulogic;
     irq_o      : out std_ulogic;
     cfs_in_i   : in  std_ulogic_vector(255 downto 0);
-    cfs_out_o  : out std_ulogic_vector(255 downto 0)
+    cfs_out_o  : out std_ulogic_vector(255 downto 0);
+    -- bus master interface --
+    cfs_req_o  : out bus_req_t;
+    cfs_rsp_i  : in  bus_rsp_t
   );
   end component;
 
