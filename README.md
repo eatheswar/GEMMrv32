@@ -10,6 +10,10 @@ GEMMrv32 is a customized RISC-V processor platform based on the
 [NEORV32](https://github.com/stnolting/neorv32) processor, extended with a dedicated
 8×8 systolic-array GEMM (General Matrix Multiplication) accelerator.
 
+![neorv32 Overview](docs/figures/gemm_architecture.png)
+
+
+
 The project explores hardware/software co-design by combining a programmable
 32-bit RISC-V processor with a spatially parallel matrix-computation engine.
 The accelerator is integrated through the NEORV32 Custom Functions Subsystem (CFS)
