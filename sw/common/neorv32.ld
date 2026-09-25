@@ -1,7 +1,7 @@
 /* ================================================================================ */
 /* NEORV32 - RISC-V GCC Linker Script                                               */
 /* -------------------------------------------------------------------------------- */
-/* The NEORV32 RISC-V Processor - https://github.com/stnolting/neorv32              */
+/* The NEORV32 RISC-V Processor - https:/*github.com/stnolting/neorv32              */
 /* Copyright (c) NEORV32 contributors.                                              */
 /* Copyright (c) 2020 - 2026 Stephan Nolting. All rights reserved.                  */
 /* Licensed under the BSD-3-Clause license, see LICENSE for details.                */
@@ -22,8 +22,8 @@ ENTRY(_start)
 __neorv32_heap_size = DEFINED(__neorv32_heap_size) ? __neorv32_heap_size : 0;
 
 /* Default rom/ram (IMEM/DMEM) sizes */
-__neorv32_rom_size = DEFINED(__neorv32_rom_size) ? __neorv32_rom_size : 16k;
-__neorv32_ram_size = DEFINED(__neorv32_ram_size) ? __neorv32_ram_size : 8K;
+__neorv32_rom_size = 128k;
+__neorv32_ram_size = 128k; /* (__neorv32_ram_size) ? __neorv32_ram_size : 8K; */
 
 /* Default rom/ram (IMEM/DMEM) base addresses */
 __neorv32_rom_base = DEFINED(__neorv32_rom_base) ? __neorv32_rom_base : 0x00000000;

@@ -359,6 +359,23 @@ architecture neorv32_top_rtl of neorv32_top is
   signal sys1_rsp, sys2_rsp, sys2b_rsp, dma_rsp, cfs_rsp, amo_rsp, sys3_rsp, imem_rsp, dmem_rsp, smc_rsp, io_rsp, xbus_rsp : bus_rsp_t;
   signal xbus_terminate : std_ulogic;
 
+  -- Interconnect Signals for GEMM Crossbar --
+  signal dma_req_addr_256  : std_ulogic_vector(31 downto 0);
+  signal dma_req_wdata_256 : std_ulogic_vector(255 downto 0);
+  signal dma_req_be_256    : std_ulogic_vector(31 downto 0);
+  signal dma_req_rw_256    : std_ulogic;
+  signal dma_req_stb_256   : std_ulogic;
+  signal dma_rsp_rdata_256 : std_ulogic_vector(255 downto 0);
+  signal dma_rsp_ack_256   : std_ulogic;
+
+  signal mem_req_addr_256  : std_ulogic_vector(31 downto 0);
+  signal mem_req_wdata_256 : std_ulogic_vector(255 downto 0);
+  signal mem_req_be_256    : std_ulogic_vector(31 downto 0);
+  signal mem_req_rw_256    : std_ulogic;
+  signal mem_req_stb_256   : std_ulogic;
+  signal mem_rsp_rdata_256 : std_ulogic_vector(255 downto 0);
+  signal mem_rsp_ack_256   : std_ulogic;
+
   -- bus: IO devices --
   type io_devices_enum_t is (
     IODEV_BOOTROM, IODEV_OCD, IODEV_SYSINFO, IODEV_NEOLED, IODEV_GPIO, IODEV_WDT, IODEV_TRNG,
@@ -873,21 +890,47 @@ begin
     -- [NOTE] Use component instantiation here to allow easy replacement by external (Verilog) IP.
     dmem_enabled:
     if DMEM_EN generate
-      dmem_inst: neorv32_dmem -- component declaration in package file
-      generic map (
-        AWIDTH => log2_dmem_size_c,
-        OUTREG => DMEM_OUTREG_EN
-      )
+      crossbar_inst: entity neorv32.neorv32_memory_crossbar
       port map (
-        clk_i      => clk_i,
-        rstn_i     => rstn_sys,
-        req_addr_i => dmem_req.addr,
-        req_data_i => dmem_req.data,
-        req_ben_i  => dmem_req.ben,
-        req_stb_i  => dmem_req.stb,
-        req_rw_i   => dmem_req.rw,
-        rsp_data_o => dmem_rsp.data,
-        rsp_ack_o  => dmem_rsp.ack
+        clk_i => clk_i,
+        rstn_i => rstn_sys,
+        -- Master 1 (CPU)
+        cpu_req_addr => dmem_req.addr,
+        cpu_req_wdata => dmem_req.data,
+        cpu_req_be => dmem_req.ben,
+        cpu_req_rw => dmem_req.rw,
+        cpu_req_stb => dmem_req.stb,
+        cpu_rsp_rdata => dmem_rsp.data,
+        cpu_rsp_ack => dmem_rsp.ack,
+        -- Master 2 (GEMM DMA)
+        dma_req_addr => dma_req_addr_256,
+        dma_req_wdata => dma_req_wdata_256,
+        dma_req_be => dma_req_be_256,
+        dma_req_rw => dma_req_rw_256,
+        dma_req_stb => dma_req_stb_256,
+        dma_rsp_rdata => dma_rsp_rdata_256,
+        dma_rsp_ack => dma_rsp_ack_256,
+        -- Slave Port
+        mem_req_addr => mem_req_addr_256,
+        mem_req_wdata => mem_req_wdata_256,
+        mem_req_be => mem_req_be_256,
+        mem_req_rw => mem_req_rw_256,
+        mem_req_stb => mem_req_stb_256,
+        mem_rsp_rdata => mem_rsp_rdata_256,
+        mem_rsp_ack => mem_rsp_ack_256
+      );
+
+      wide_bram_inst: entity neorv32.neorv32_wide_bram
+      port map (
+        clk_i => clk_i,
+        rstn_i => rstn_sys,
+        req_addr => mem_req_addr_256,
+        req_wdata => mem_req_wdata_256,
+        req_be => mem_req_be_256,
+        req_rw => mem_req_rw_256,
+        req_stb => mem_req_stb_256,
+        rsp_rdata => mem_rsp_rdata_256,
+        rsp_ack => mem_rsp_ack_256
       );
       dmem_rsp.err <= '0';
     end generate;
@@ -1104,7 +1147,15 @@ begin
         cfs_in_i   => cfs_in_i,
         cfs_out_o  => cfs_out_o,
         cfs_req_o  => cfs_req,
-        cfs_rsp_i  => cfs_rsp
+        cfs_rsp_i  => cfs_rsp,
+        -- Wire 256-bit Soft DMA out of CFS to Crossbar
+        dma_req_addr => dma_req_addr_256,
+        dma_req_wdata => dma_req_wdata_256,
+        dma_req_be => dma_req_be_256,
+        dma_req_rw => dma_req_rw_256,
+        dma_req_stb => dma_req_stb_256,
+        dma_rsp_rdata => dma_rsp_rdata_256,
+        dma_rsp_ack => dma_rsp_ack_256
       );
       iodev_rsp(IODEV_CFS).err <= '0';
     end generate;

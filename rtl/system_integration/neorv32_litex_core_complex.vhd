@@ -133,8 +133,13 @@ begin
     -- Internal memories --
     DMEM_EN               => configs_c.dmem(CONFIG),
     IMEM_EN               => configs_c.imem(CONFIG),
-    DCACHE_EN             => configs_c.dcache(CONFIG),
-    ICACHE_EN             => configs_c.icache(CONFIG),
+    ICACHE_EN             => true, -- configs_c.icache(CONFIG) overridden
+    ICACHE_NUM_BLOCKS     => 16,
+    ICACHE_BLOCK_SIZE     => 128,
+    DCACHE_EN             => true, -- configs_c.dcache(CONFIG) overridden
+    DCACHE_NUM_BLOCKS     => 16,
+    DCACHE_BLOCK_SIZE     => 128,
+    IO_CFS_EN             => true,
     -- Physical Memory Protection (PMP) --
     PMP_NUM_REGIONS       => configs_c.pmp_num(CONFIG),      -- number of regions (0..16)
     PMP_MIN_GRANULARITY   => 4,                              -- minimal region granularity in bytes, has to be a power of 2, min 4 bytes

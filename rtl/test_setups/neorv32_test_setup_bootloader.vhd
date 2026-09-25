@@ -19,8 +19,8 @@ entity neorv32_test_setup_bootloader is
   generic (
     -- adapt these for your setup --
     CLOCK_FREQUENCY : natural := 100000000; -- clock frequency of clk_i in Hz
-    IMEM_SIZE       : natural := 16*1024;   -- size of processor-internal instruction memory in bytes
-    DMEM_SIZE       : natural := 8*1024     -- size of processor-internal data memory in bytes
+    IMEM_SIZE       : natural := 128*1024;   -- size of processor-internal instruction memory in bytes
+    DMEM_SIZE       : natural := 128*1024     -- size of processor-internal data memory in bytes
   );
   port (
     -- Global control --
@@ -57,9 +57,11 @@ begin
     IMEM_SIZE        => IMEM_SIZE, -- size of processor-internal instruction memory in bytes
     -- Internal Data memory --
     DMEM_EN          => true,              -- implement processor-internal data memory
+     
     DMEM_SIZE        => DMEM_SIZE, -- size of processor-internal data memory in bytes
+    IO_CFS_EN                    => true,
     -- Processor peripherals --
-    IO_GPIO_NUM      => 8,                 -- number of GPIO input/output pairs (0..32)
+    IO_GPIO_NUM                  => 8,         -- number of GPIO input/output pairs (0..32)
     IO_CLINT_EN      => true,              -- implement core local interruptor (CLINT)?
     IO_UART0_EN      => true               -- implement primary universal asynchronous receiver/transmitter (UART0)?
   )

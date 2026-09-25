@@ -1,5 +1,6 @@
 -- ================================================================================ --
 -- NEORV32 SoC - Custom Functions Subsystem (CFS) for GEMM Accelerator              --
+-- Featuring: 2D Strided DMA Engine, Bounds Checking, & Pipelined MAC Array         --
 -- ================================================================================ --
 
 library ieee;
@@ -13,6 +14,7 @@ entity neorv32_cfs is
   port (
     clk_i      : in  std_ulogic;
     rstn_i     : in  std_ulogic;
+    
     req_addr_i : in  std_ulogic_vector(15 downto 0);
     req_data_i : in  std_ulogic_vector(31 downto 0);
     req_ben_i  : in  std_ulogic_vector(3 downto 0);
@@ -21,391 +23,361 @@ entity neorv32_cfs is
     rsp_data_o : out std_ulogic_vector(31 downto 0);
     rsp_ack_o  : out std_ulogic;
     irq_o      : out std_ulogic;
+    
     cfs_in_i   : in  std_ulogic_vector(255 downto 0);
     cfs_out_o  : out std_ulogic_vector(255 downto 0);
-    -- bus master interface --
     cfs_req_o  : out bus_req_t;
-    cfs_rsp_i  : in  bus_rsp_t
+    cfs_rsp_i  : in  bus_rsp_t;
+    
+    dma_req_addr  : out std_ulogic_vector(31 downto 0);
+    dma_req_wdata : out std_ulogic_vector(255 downto 0);
+    dma_req_be    : out std_ulogic_vector(31 downto 0);
+    dma_req_rw    : out std_ulogic;
+    dma_req_stb   : out std_ulogic;
+    dma_rsp_rdata : in  std_ulogic_vector(255 downto 0);
+    dma_rsp_ack   : in  std_ulogic
   );
 end entity;
 
-architecture neorv32_cfs_rtl of neorv32_cfs is
+architecture rtl of neorv32_cfs is
 
-    -- Registers
-    signal reg_base_a    : std_ulogic_vector(31 downto 0);
-    signal reg_base_b    : std_ulogic_vector(31 downto 0);
-    signal reg_base_c    : std_ulogic_vector(31 downto 0);
-    signal reg_stride    : std_ulogic_vector(31 downto 0);
-    signal reg_dimension : std_ulogic_vector(31 downto 0);
+    signal reg_base_a    : unsigned(31 downto 0);
+    signal reg_base_b    : unsigned(31 downto 0);
+    signal reg_base_c    : unsigned(31 downto 0);
+    signal reg_stride_a  : unsigned(15 downto 0);
+    signal reg_stride_b  : unsigned(15 downto 0);
+    signal reg_stride_c  : unsigned(15 downto 0);
+    signal reg_bounds    : unsigned(31 downto 0);
     
-    signal status_busy : std_ulogic;
-    signal status_done : std_ulogic;
-    signal cmd_start   : std_ulogic;
+    signal cmd_start     : std_ulogic;
+    signal cmd_clear     : std_ulogic;
+    signal cmd_store     : std_ulogic;
+    signal status_done   : std_ulogic;
 
-    -- Systolic Array PE definition
-    type pe_acc_t is array(0 to 7, 0 to 7) of signed(31 downto 0);
-    type pe_a_t   is array(0 to 7, 0 to 7) of signed(7 downto 0);
-    type pe_b_t   is array(0 to 7, 0 to 7) of signed(7 downto 0);
-    
-    signal pe_acc : pe_acc_t;
-    signal pe_a   : pe_a_t;
-    signal pe_b   : pe_b_t;
-    
-    -- Ping-Pong Buffers
-    type byte_array is array(0 to 63) of std_ulogic_vector(7 downto 0);
-    signal a_ping, a_pong : byte_array;
-    signal b_ping, b_pong : byte_array;
-
-    -- State Machines
-    type state_t is (S_IDLE, S_INIT_TILE, S_LOAD_A, S_LOAD_A_WAIT, S_LOAD_B, S_LOAD_B_WAIT, S_WAIT_COMPUTE, S_STORE_C, S_STORE_C_WAIT, S_DONE);
+    type state_t is (S_IDLE, 
+                     S_FETCH_A, S_FETCH_A_WAIT, 
+                     S_FETCH_B, S_FETCH_B_WAIT, 
+                     S_COMP_INIT, S_COMP_ROW_INIT, S_COMP_MAC, S_COMP_ACCUM, 
+                     S_STORE_C, S_STORE_C_WAIT, S_DONE);
     signal state : state_t;
 
-    -- AGU Counters and variables
-    signal tile_i : unsigned(15 downto 0);
-    signal tile_j : unsigned(15 downto 0);
-    signal tile_k : unsigned(15 downto 0);
-    signal read_cnt : unsigned(4 downto 0);
-    signal write_cnt : unsigned(6 downto 0);
+    signal row_cnt : integer range 0 to 7;
+    signal col_cnt : integer range 0 to 7;
+    signal k_cnt   : integer range 0 to 7;
+
+    type buffer_8x8_8b_t is array (0 to 63) of signed(7 downto 0);
+    signal buf_A : buffer_8x8_8b_t;
+    signal buf_B : buffer_8x8_8b_t;
     
-    signal ping_pong_sel : std_ulogic;
+    type buffer_8x8_32b_t is array (0 to 63) of signed(31 downto 0);
+    signal buf_C : buffer_8x8_32b_t;
     
-    -- Compute FSM
-    type comp_state_t is (C_IDLE, C_COMPUTE, C_WAIT);
-    signal comp_state : comp_state_t;
-    signal comp_cnt : unsigned(4 downto 0);
-    signal comp_start : std_ulogic;
-    signal comp_done : std_ulogic;
-    signal comp_clear_acc : std_ulogic;
-    
-    -- Bus interfacing
-    signal bus_req : bus_req_t;
-    
-    signal a_in : pe_a_t;
-    signal b_in : pe_b_t;
+    type sum_reg_t is array (0 to 7) of signed(31 downto 0);
+    signal sum_reg : sum_reg_t;
+
+    -- Hardware performance counters (accumulated across all tiles, reset on cmd_clear)
+    signal perf_fetch_a_cycles  : unsigned(31 downto 0); -- cycles in S_FETCH_A + S_FETCH_A_WAIT
+    signal perf_fetch_b_cycles  : unsigned(31 downto 0); -- cycles in S_FETCH_B + S_FETCH_B_WAIT
+    signal perf_compute_cycles  : unsigned(31 downto 0); -- cycles in S_COMP_* states
+    signal perf_store_cycles    : unsigned(31 downto 0); -- cycles in S_STORE_C + S_STORE_C_WAIT
 
 begin
 
     cfs_out_o <= (others => '0');
-    irq_o <= status_done;
-    cfs_req_o <= bus_req;
+    cfs_req_o <= req_terminate_c;
+    irq_o     <= status_done;
 
-    -- MMIO Access
     process(rstn_i, clk_i)
     begin
         if rstn_i = '0' then
             reg_base_a <= (others => '0');
             reg_base_b <= (others => '0');
             reg_base_c <= (others => '0');
-            reg_stride <= (others => '0');
-            reg_dimension <= (others => '0');
+            reg_stride_a <= (others => '0');
+            reg_stride_b <= (others => '0');
+            reg_stride_c <= (others => '0');
+            reg_bounds <= (others => '0');
             cmd_start <= '0';
-            status_done <= '0';
+            cmd_clear <= '0';
+            cmd_store <= '0';
             rsp_ack_o <= '0';
             rsp_data_o <= (others => '0');
+            perf_fetch_a_cycles <= (others => '0');
+            perf_fetch_b_cycles <= (others => '0');
+            perf_compute_cycles <= (others => '0');
+            perf_store_cycles   <= (others => '0');
         elsif rising_edge(clk_i) then
             rsp_ack_o <= req_stb_i;
             rsp_data_o <= (others => '0');
-            cmd_start <= '0';
             
-            if status_done = '1' and req_stb_i = '1' and req_rw_i = '1' and req_addr_i(15 downto 2) = "00000000000101" then
-                if req_data_i(2) = '0' then
-                    status_done <= '0';
-                end if;
+            if req_stb_i = '1' and req_rw_i = '1' then
+                case req_addr_i(4 downto 2) is
+                    when "000" => reg_base_a <= unsigned(req_data_i);
+                    when "001" => reg_base_b <= unsigned(req_data_i);
+                    when "010" => reg_base_c <= unsigned(req_data_i);
+                    when "011" => reg_stride_a <= unsigned(req_data_i(15 downto 0));
+                    when "100" => reg_stride_b <= unsigned(req_data_i(15 downto 0));
+                    when "101" => reg_stride_c <= unsigned(req_data_i(15 downto 0));
+                    when "110" => 
+                        cmd_start <= req_data_i(0);
+                        cmd_clear <= req_data_i(1);
+                        cmd_store <= req_data_i(2);
+                        -- Writing bit 3 (=8) resets the performance counters
+                        if req_data_i(3) = '1' then
+                            perf_fetch_a_cycles <= (others => '0');
+                            perf_fetch_b_cycles <= (others => '0');
+                            perf_compute_cycles <= (others => '0');
+                            perf_store_cycles   <= (others => '0');
+                        end if;
+                    when "111" => reg_bounds <= unsigned(req_data_i);
+                    when others => null;
+                end case;
             end if;
             
-            if state = S_DONE then
-                status_done <= '1';
-                 
-            end if;
-
-            if req_stb_i = '1' then
-                if req_rw_i = '1' then
-                    case req_addr_i(15 downto 2) is
-                        when "00000000000000" => reg_base_a <= req_data_i;
-                        when "00000000000001" => reg_base_b <= req_data_i;
-                        when "00000000000010" => reg_base_c <= req_data_i;
-                        when "00000000000011" => reg_stride <= req_data_i;
-                        when "00000000000100" => reg_dimension <= req_data_i;
-                        when "00000000000101" => 
-                            if req_data_i(0) = '1' then
-                                cmd_start <= '1';
-                                status_done <= '0';
-                            else
-                                cmd_start <= '0';
-                            end if;
-                        when others => null;
-                    end case;
-                else
-                    case req_addr_i(15 downto 2) is
-                        when "00000000000000" => rsp_data_o <= reg_base_a;
-                        when "00000000000001" => rsp_data_o <= reg_base_b;
-                        when "00000000000010" => rsp_data_o <= reg_base_c;
-                        when "00000000000011" => rsp_data_o <= reg_stride;
-                        when "00000000000100" => rsp_data_o <= reg_dimension;
-                        when "00000000000101" => 
-                            rsp_data_o(0) <= '0';
-                            rsp_data_o(1) <= status_busy;
-                            rsp_data_o(2) <= status_done;
-                            rsp_data_o(31 downto 3) <= (others => '0');
-                        when others => rsp_data_o <= (others => '0');
-                    end case;
-                end if;
+            if req_stb_i = '1' and req_rw_i = '0' then
+                case req_addr_i(4 downto 2) is
+                    when "110" => rsp_data_o(2) <= status_done;
+                    -- Performance counter readout (read-only)
+                    when "000" => rsp_data_o <= std_ulogic_vector(perf_fetch_a_cycles);
+                    when "001" => rsp_data_o <= std_ulogic_vector(perf_fetch_b_cycles);
+                    when "010" => rsp_data_o <= std_ulogic_vector(perf_compute_cycles);
+                    when "011" => rsp_data_o <= std_ulogic_vector(perf_store_cycles);
+                    when others => null;
+                end case;
             end if;
         end if;
     end process;
 
-    -- Master AGU FSM
     process(rstn_i, clk_i)
-        variable base_addr : unsigned(31 downto 0);
-        variable offset : unsigned(31 downto 0);
-        variable row : unsigned(15 downto 0);
-        variable col : unsigned(15 downto 0);
-        variable word_idx : unsigned(15 downto 0);
+        variable addr_val : unsigned(31 downto 0);
+        variable offset   : integer range 0 to 31;
+        variable tile_M   : integer range 0 to 255;
+        variable tile_K   : integer range 0 to 255;
+        variable tile_N   : integer range 0 to 255;
     begin
         if rstn_i = '0' then
             state <= S_IDLE;
-            status_busy <= '0';
-            bus_req <= req_terminate_c;
-            tile_i <= (others => '0');
-            tile_j <= (others => '0');
-            tile_k <= (others => '0');
-            read_cnt <= (others => '0');
-            write_cnt <= (others => '0');
-            ping_pong_sel <= '0';
-            comp_start <= '0';
-            comp_clear_acc <= '0';
+            dma_req_stb <= '0';
+            status_done <= '0';
+            for i in 0 to 63 loop
+                buf_C(i) <= (others => '0');
+            end loop;
         elsif rising_edge(clk_i) then
-            comp_start <= '0';
-            comp_clear_acc <= '0';
-            bus_req.stb <= '0';
+            dma_req_stb <= '0';
+            tile_M := to_integer(reg_bounds(23 downto 16));
+            tile_K := to_integer(reg_bounds(15 downto 8));
+            tile_N := to_integer(reg_bounds(7 downto 0));
+            
+            -- Per-cycle performance counter increments
+            case state is
+                when S_FETCH_A | S_FETCH_A_WAIT =>
+                    perf_fetch_a_cycles <= perf_fetch_a_cycles + 1;
+                when S_FETCH_B | S_FETCH_B_WAIT =>
+                    perf_fetch_b_cycles <= perf_fetch_b_cycles + 1;
+                when S_COMP_INIT | S_COMP_ROW_INIT | S_COMP_MAC | S_COMP_ACCUM =>
+                    perf_compute_cycles <= perf_compute_cycles + 1;
+                when S_STORE_C | S_STORE_C_WAIT =>
+                    perf_store_cycles <= perf_store_cycles + 1;
+                when others => null;
+            end case;
             
             case state is
                 when S_IDLE =>
-                    bus_req.stb <= '0';
-                    bus_req.stb <= '0';
-                    if cmd_start = '1' and status_done = '0' then
-                        state <= S_INIT_TILE;
-                        status_busy <= '1';
-                        tile_i <= (others => '0');
-                        tile_j <= (others => '0');
-                        tile_k <= (others => '0');
+                    if cmd_start = '1' then
+                        if cmd_clear = '1' then
+                            for i in 0 to 63 loop
+                                buf_C(i) <= (others => '0');
+                            end loop;
+                        end if;
+                        row_cnt <= 0;
+                        col_cnt <= 0;
+                        state <= S_FETCH_A;
+                        status_done <= '0';
+                    end if;
+                    
+                when S_FETCH_A =>
+                    if row_cnt < tile_M then
+                        addr_val := reg_base_a + resize(to_unsigned(row_cnt, 16) * reg_stride_a, 32) + to_unsigned(col_cnt, 32);
+                        dma_req_addr <= std_ulogic_vector(addr_val);
+                        dma_req_rw <= '0';
+                        dma_req_be <= (others => '1');
+                        dma_req_stb <= '1';
+                        state <= S_FETCH_A_WAIT;
                     else
-                        status_busy <= '0';
-                    end if;
-                    
-                when S_INIT_TILE =>
-                    comp_clear_acc <= '1';
-                    tile_k <= (others => '0');
-                    ping_pong_sel <= '0';
-                    state <= S_LOAD_A;
-                    read_cnt <= (others => '0');
-                    
-                when S_LOAD_A =>
-                    row := resize(tile_i * 8, 16) + resize(read_cnt(4 downto 1), 16);
-                    col := resize(tile_k * 8, 16) + resize(read_cnt(0 downto 0) & "00", 16);
-                    base_addr := unsigned(reg_base_a);
-                    offset := resize(row * unsigned(reg_stride(15 downto 0)), 32) + resize(col, 32);
-                    bus_req.addr <= std_ulogic_vector(base_addr + offset);
-                    bus_req.data <= (others => '0');
-                    bus_req.ben <= "1111";
-                    bus_req.rw <= '0';
-                    bus_req.stb <= '1';
-                    state <= S_LOAD_A_WAIT;
-                    
-                when S_LOAD_A_WAIT =>
-                    if cfs_rsp_i.ack = '1' then
-                        bus_req.stb <= '0';
-                        if ping_pong_sel = '0' then
-                            a_ping(to_integer(read_cnt)*4 + 0) <= cfs_rsp_i.data(7 downto 0);
-                            a_ping(to_integer(read_cnt)*4 + 1) <= cfs_rsp_i.data(15 downto 8);
-                            a_ping(to_integer(read_cnt)*4 + 2) <= cfs_rsp_i.data(23 downto 16);
-                            a_ping(to_integer(read_cnt)*4 + 3) <= cfs_rsp_i.data(31 downto 24);
+                        for c in 0 to 7 loop
+                            buf_A(row_cnt*8 + c) <= (others => '0');
+                        end loop;
+                        if row_cnt = 7 then
+                            row_cnt <= 0;
+                            col_cnt <= 0;
+                            state <= S_FETCH_B;
                         else
-                            a_pong(to_integer(read_cnt)*4 + 0) <= cfs_rsp_i.data(7 downto 0);
-                            a_pong(to_integer(read_cnt)*4 + 1) <= cfs_rsp_i.data(15 downto 8);
-                            a_pong(to_integer(read_cnt)*4 + 2) <= cfs_rsp_i.data(23 downto 16);
-                            a_pong(to_integer(read_cnt)*4 + 3) <= cfs_rsp_i.data(31 downto 24);
-                        end if;
-                        if read_cnt = 15 then
-                            read_cnt <= (others => '0');
-                            state <= S_LOAD_B;
-                        else
-                            read_cnt <= read_cnt + 1;
-                            state <= S_LOAD_A;
+                            row_cnt <= row_cnt + 1;
+                            state <= S_FETCH_A;
                         end if;
                     end if;
                     
-                when S_LOAD_B =>
-                    row := resize(tile_k * 8, 16) + resize(read_cnt(4 downto 1), 16);
-                    col := resize(tile_j * 8, 16) + resize(read_cnt(0 downto 0) & "00", 16);
-                    base_addr := unsigned(reg_base_b);
-                    offset := resize(row * unsigned(reg_stride(15 downto 0)), 32) + resize(col, 32);
-                    bus_req.addr <= std_ulogic_vector(base_addr + offset);
-                    bus_req.data <= (others => '0');
-                    bus_req.ben <= "1111";
-                    bus_req.rw <= '0';
-                    bus_req.stb <= '1';
-                    state <= S_LOAD_B_WAIT;
-                    
-                when S_LOAD_B_WAIT =>
-                    if cfs_rsp_i.ack = '1' then
-                        bus_req.stb <= '0';
-                        if ping_pong_sel = '0' then
-                            b_ping(to_integer(read_cnt)*4 + 0) <= cfs_rsp_i.data(7 downto 0);
-                            b_ping(to_integer(read_cnt)*4 + 1) <= cfs_rsp_i.data(15 downto 8);
-                            b_ping(to_integer(read_cnt)*4 + 2) <= cfs_rsp_i.data(23 downto 16);
-                            b_ping(to_integer(read_cnt)*4 + 3) <= cfs_rsp_i.data(31 downto 24);
-                        else
-                            b_pong(to_integer(read_cnt)*4 + 0) <= cfs_rsp_i.data(7 downto 0);
-                            b_pong(to_integer(read_cnt)*4 + 1) <= cfs_rsp_i.data(15 downto 8);
-                            b_pong(to_integer(read_cnt)*4 + 2) <= cfs_rsp_i.data(23 downto 16);
-                            b_pong(to_integer(read_cnt)*4 + 3) <= cfs_rsp_i.data(31 downto 24);
-                        end if;
-                        if read_cnt = 15 then
-                            read_cnt <= (others => '0');
-                            comp_start <= '1';
-                            if tile_k = 0 then
-                                comp_clear_acc <= '1';
+                when S_FETCH_A_WAIT =>
+                    if dma_rsp_ack = '1' then
+                        addr_val := reg_base_a + resize(to_unsigned(row_cnt, 16) * reg_stride_a, 32) + to_unsigned(col_cnt, 32);
+                        offset := to_integer(addr_val(4 downto 0));
+                        for c in 0 to 7 loop
+                            if (offset + c) <= 31 then
+                                buf_A(row_cnt*8 + c) <= signed(dma_rsp_rdata((offset+c)*8+7 downto (offset+c)*8));
+                            else
+                                buf_A(row_cnt*8 + c) <= (others => '0');
                             end if;
-                            state <= S_WAIT_COMPUTE;
+                        end loop;
+                        
+                        if row_cnt = 7 then
+                            row_cnt <= 0;
+                            col_cnt <= 0;
+                            state <= S_FETCH_B;
                         else
-                            read_cnt <= read_cnt + 1;
-                            state <= S_LOAD_B;
+                            row_cnt <= row_cnt + 1;
+                            state <= S_FETCH_A;
                         end if;
+                    else
+                        dma_req_stb <= '1';
                     end if;
 
-                when S_WAIT_COMPUTE =>
-                    if comp_done = '1' then
-                        if resize((tile_k + 1) * 8, 16) < unsigned(reg_dimension(15 downto 0)) then
-                            tile_k <= tile_k + 1;
-                            ping_pong_sel <= not ping_pong_sel;
-                            read_cnt <= (others => '0');
-                            state <= S_LOAD_A;
+                when S_FETCH_B =>
+                    if row_cnt < tile_K then
+                        addr_val := reg_base_b + resize(to_unsigned(row_cnt, 16) * reg_stride_b, 32) + to_unsigned(col_cnt, 32);
+                        dma_req_addr <= std_ulogic_vector(addr_val);
+                        dma_req_rw <= '0';
+                        dma_req_be <= (others => '1');
+                        dma_req_stb <= '1';
+                        state <= S_FETCH_B_WAIT;
+                    else
+                        for c in 0 to 7 loop
+                            buf_B(row_cnt*8 + c) <= (others => '0');
+                        end loop;
+                        if row_cnt = 7 then
+                            col_cnt <= 0;
+                            row_cnt <= 0;
+                            state <= S_COMP_INIT;
                         else
-                            write_cnt <= (others => '0');
+                            row_cnt <= row_cnt + 1;
+                            state <= S_FETCH_B;
+                        end if;
+                    end if;
+                    
+                when S_FETCH_B_WAIT =>
+                    if dma_rsp_ack = '1' then
+                        addr_val := reg_base_b + resize(to_unsigned(row_cnt, 16) * reg_stride_b, 32) + to_unsigned(col_cnt, 32);
+                        offset := to_integer(addr_val(4 downto 0));
+                        for c in 0 to 7 loop
+                            if (offset + c) <= 31 then
+                                buf_B(row_cnt*8 + c) <= signed(dma_rsp_rdata((offset+c)*8+7 downto (offset+c)*8));
+                            else
+                                buf_B(row_cnt*8 + c) <= (others => '0');
+                            end if;
+                        end loop;
+                        
+                        if row_cnt = 7 then
+                            col_cnt <= 0;
+                            row_cnt <= 0;
+                            state <= S_COMP_INIT;
+                        else
+                            row_cnt <= row_cnt + 1;
+                            state <= S_FETCH_B;
+                        end if;
+                    else
+                        dma_req_stb <= '1';
+                    end if;
+
+                when S_COMP_INIT =>
+                    row_cnt <= 0;
+                    state <= S_COMP_ROW_INIT;
+                    
+                when S_COMP_ROW_INIT =>
+                    for j in 0 to 7 loop
+                        sum_reg(j) <= (others => '0');
+                    end loop;
+                    k_cnt <= 0;
+                    state <= S_COMP_MAC;
+                    
+                when S_COMP_MAC =>
+                    for j in 0 to 7 loop
+                        sum_reg(j) <= sum_reg(j) + resize(buf_A(row_cnt*8 + k_cnt) * buf_B(k_cnt*8 + j), 32);
+                    end loop;
+                    if k_cnt = 7 then
+                        state <= S_COMP_ACCUM;
+                    else
+                        k_cnt <= k_cnt + 1;
+                    end if;
+                    
+                when S_COMP_ACCUM =>
+                    for j in 0 to 7 loop
+                        buf_C(row_cnt*8 + j) <= buf_C(row_cnt*8 + j) + sum_reg(j);
+                    end loop;
+                    if row_cnt = 7 then
+                        if cmd_store = '1' then
+                            row_cnt <= 0;
+                            col_cnt <= 0;
+                            state <= S_STORE_C;
+                        else
+                            state <= S_DONE;
+                        end if;
+                    else
+                        row_cnt <= row_cnt + 1;
+                        state <= S_COMP_ROW_INIT;
+                    end if;
+
+                when S_STORE_C =>
+                    if row_cnt < tile_M then
+                        addr_val := reg_base_c + shift_left(resize(to_unsigned(row_cnt, 16) * reg_stride_c + to_unsigned(col_cnt, 16), 32), 2);
+                        dma_req_addr <= std_ulogic_vector(addr_val);
+                        dma_req_rw <= '1';
+                        
+                        dma_req_wdata <= (others => '0');
+                        dma_req_be <= (others => '0');
+                        
+                        offset := to_integer(addr_val(4 downto 2));
+                        for c in 0 to 7 loop
+                            if (offset + c) <= 7 then
+                                dma_req_wdata((offset+c)*32+31 downto (offset+c)*32) <= std_ulogic_vector(buf_C(row_cnt*8 + c));
+                                dma_req_be((offset+c)*4+3 downto (offset+c)*4) <= "1111";
+                            end if;
+                        end loop;
+                        
+                        dma_req_stb <= '1';
+                        state <= S_STORE_C_WAIT;
+                    else
+                        if row_cnt = 7 then
+                            col_cnt <= 0;
+                            row_cnt <= 0;
+                            state <= S_DONE;
+                        else
+                            row_cnt <= row_cnt + 1;
                             state <= S_STORE_C;
                         end if;
                     end if;
                     
-                when S_STORE_C =>
-                    row := resize(tile_i * 8, 16) + resize(write_cnt(5 downto 3), 16);
-                    col := resize(tile_j * 8, 16) + resize(write_cnt(2 downto 0), 16);
-                    base_addr := unsigned(reg_base_c);
-                    offset := resize((resize(row * unsigned(reg_stride(15 downto 0)), 32) + resize(col, 32)) * 4, 32);
-                    bus_req.addr <= std_ulogic_vector(base_addr + offset);
-                    bus_req.data <= std_ulogic_vector(pe_acc(to_integer(write_cnt(5 downto 3)), to_integer(write_cnt(2 downto 0))));
-                    bus_req.ben <= "1111";
-                    bus_req.rw <= '1';
-                    bus_req.stb <= '1';
-                    state <= S_STORE_C_WAIT;
-                    
                 when S_STORE_C_WAIT =>
-                    if cfs_rsp_i.ack = '1' then
-                        bus_req.stb <= '0';
-                        if write_cnt = 63 then
-                            if resize((tile_j + 1) * 8, 16) < unsigned(reg_dimension(15 downto 0)) then
-                                tile_j <= tile_j + 1;
-                                state <= S_INIT_TILE;
-                            else
-                                tile_j <= (others => '0');
-                                if resize((tile_i + 1) * 8, 16) < unsigned(reg_dimension(15 downto 0)) then
-                                    tile_i <= tile_i + 1;
-                                    state <= S_INIT_TILE;
-                                else
-                                     
-                                    state <= S_DONE;
-                                end if;
-                            end if;
+                    if dma_rsp_ack = '1' then
+                        if row_cnt = 7 then
+                            col_cnt <= 0;
+                            row_cnt <= 0;
+                            state <= S_DONE;
                         else
-                            write_cnt <= write_cnt + 1;
+                            row_cnt <= row_cnt + 1;
                             state <= S_STORE_C;
                         end if;
+                    else
+                        dma_req_stb <= '1';
                     end if;
 
                 when S_DONE =>
-                    state <= S_IDLE;
-            end case;
-        end if;
-    end process;
-    
-    -- Compute FSM and Systolic Array
-    process(rstn_i, clk_i)
-    begin
-        if rstn_i = '0' then
-            comp_state <= C_IDLE;
-            comp_cnt <= (others => '0');
-            comp_done <= '0';
-            for r in 0 to 7 loop
-                for c in 0 to 7 loop
-                    pe_acc(r, c) <= (others => '0');
-                    pe_a(r, c) <= (others => '0');
-                    pe_b(r, c) <= (others => '0');
-                end loop;
-            end loop;
-        elsif rising_edge(clk_i) then
-            comp_done <= '0';
-            
-            if comp_clear_acc = '1' then
-                for r in 0 to 7 loop
-                    for c in 0 to 7 loop
-                        pe_acc(r, c) <= (others => '0');
-                    end loop;
-                end loop;
-            end if;
-            
-            case comp_state is
-                when C_IDLE =>
-                    if comp_start = '1' then
-                        comp_state <= C_COMPUTE;
-                        comp_cnt <= (others => '0');
-                    end if;
-                    
-                when C_COMPUTE =>
-                    -- 15 cycles of compute
-                    -- In each cycle, shift A right and B down
-                    for r in 0 to 7 loop
-                        for c in 0 to 7 loop
-                            pe_acc(r, c) <= pe_acc(r, c) + resize(pe_a(r, c) * pe_b(r, c), 32);
-                            
-                            if c = 0 then
-                                if (comp_cnt >= r) and (comp_cnt - r < 8) then
-                                    if ping_pong_sel = '0' then
-                                        pe_a(r, c) <= signed(a_ping(r * 8 + to_integer(comp_cnt - r)));
-                                    else
-                                        pe_a(r, c) <= signed(a_pong(r * 8 + to_integer(comp_cnt - r)));
-                                    end if;
-                                else
-                                    pe_a(r, c) <= (others => '0');
-                                end if;
-                            else
-                                pe_a(r, c) <= pe_a(r, c-1);
-                            end if;
-                            
-                            if r = 0 then
-                                if (comp_cnt >= c) and (comp_cnt - c < 8) then
-                                    if ping_pong_sel = '0' then
-                                        pe_b(r, c) <= signed(b_ping(to_integer(comp_cnt - c) * 8 + c));
-                                    else
-                                        pe_b(r, c) <= signed(b_pong(to_integer(comp_cnt - c) * 8 + c));
-                                    end if;
-                                else
-                                    pe_b(r, c) <= (others => '0');
-                                end if;
-                            else
-                                pe_b(r, c) <= pe_b(r-1, c);
-                            end if;
-                        end loop;
-                    end loop;
-                    
-                    if comp_cnt = 22 then
-                        comp_state <= C_IDLE;
-                        comp_done <= '1';
-                    else
-                        comp_cnt <= comp_cnt + 1;
+                    status_done <= '1';
+                    if cmd_start = '0' then
+                        status_done <= '0';
+                        state <= S_IDLE;
                     end if;
                     
                 when others =>
-                    comp_state <= C_IDLE;
+                    state <= S_IDLE;
             end case;
         end if;
     end process;

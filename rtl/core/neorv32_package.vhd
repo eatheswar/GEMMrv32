@@ -1217,7 +1217,15 @@ package neorv32_package is
     cfs_out_o  : out std_ulogic_vector(255 downto 0);
     -- bus master interface --
     cfs_req_o  : out bus_req_t;
-    cfs_rsp_i  : in  bus_rsp_t
+    cfs_rsp_i  : in  bus_rsp_t;
+    -- NEW: 256-bit Soft DMA Interface (to Crossbar)
+    dma_req_addr  : out std_ulogic_vector(31 downto 0);
+    dma_req_wdata : out std_ulogic_vector(255 downto 0);
+    dma_req_be    : out std_ulogic_vector(31 downto 0);
+    dma_req_rw    : out std_ulogic;
+    dma_req_stb   : out std_ulogic;
+    dma_rsp_rdata : in  std_ulogic_vector(255 downto 0);
+    dma_rsp_ack   : in  std_ulogic
   );
   end component;
 
